@@ -95,3 +95,19 @@ def test_relative_C_in_worktree(git_fleximod, populated_clone, tmp_path):
     assert PROCESSED["update"] in result.stdout
     # Populating writes the submodule's .git; an unchanged mtime shows nothing was re-cloned.
     assert submodule_git.stat().st_mtime_ns == populated_at
+
+
+def test_absolute_C_from_other_cwd(git_fleximod, populated_clone, tmp_path):
+    # The post-checkout block (which reports local mods) must run when cwd is not the repo.
+    result = git_fleximod(populated_clone, "update")
+    assert result.returncode == 0
+    readme = populated_clone / SUBMODULE_PATH / "README"
+    assert readme.is_file()
+    readme.write_text(readme.read_text() + "local modification\n")
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    result = git_fleximod(elsewhere, f"-C {populated_clone} update")
+    assert result.returncode == 0
+    assert "has modified files" in result.stdout
+    assert "README" in result.stdout

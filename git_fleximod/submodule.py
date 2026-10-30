@@ -527,7 +527,7 @@ class Submodule:
                     f"Failed to checkout {self.name} {repo_exists} {repodir} {self.path}"
                 )
 
-        if os.path.exists(os.path.join(self.path, ".git")):
+        if os.path.exists(os.path.join(repodir, ".git")):
             submoddir = os.path.join(self.root_dir, self.path)
             with utils.pushd(submoddir):
                 git = GitInterface(submoddir, self.logger)
