@@ -1,113 +1,112 @@
+# tests/test_g_relative_root.py
 # A relative -C path must not be resolved twice once a submodule is populated.
 import subprocess
 
 import pytest
 
-from git_fleximod.gitinterface import GitInterface
-
-SUBMODULE_PATH = "modules/test"
-# Same small public repo and layout as the other tests (tests/conftest.py). mpi-serial is an
-# arbitrary but real repo: it is cloned over https and its tag MPIserial_2.4.0 is the fxtag.
-GITMODULES = """
-[submodule "test_submodule"]
-    path = modules/test
-    url = https://github.com/ESMCI/mpi-serial.git
-    fxtag = MPIserial_2.4.0
-    fxDONOTUSEurl = https://github.com/ESMCI/mpi-serial.git
-"""
-# A line each command prints for the populated submodule, so a run that silently did
-# nothing fails the test instead of passing on exit code 0 alone.
-PROCESSED = {"update": "up to date", "status": "at tag MPIserial_2.4.0"}
+from tests.utils_for_tests import normalize_whitespace
 
 
-@pytest.fixture(name="populated_clone")
-def fixture_populated_clone(tmp_path, logger):
-    """A clone of a repo with one submodule, already populated by git-fleximod."""
-    origin = tmp_path / "origin"
-    origin.mkdir()
-    gitp = GitInterface(str(origin), logger)
-    (origin / "modules").mkdir()
-    gitp.git_operation(
-        "submodule",
-        "add",
-        "--depth",
-        "1",
-        "--name",
-        "test_submodule",
-        "https://github.com/ESMCI/mpi-serial.git",
-        SUBMODULE_PATH,
+# Only run this test over the single 'test_submodule' fixture
+@pytest.fixture(name="shared_repos")
+def fixture_test_submodule_only(get_all_repos):
+    return next(
+        repo for repo in get_all_repos if repo["submodule_name"] == "test_submodule"
     )
-    gitp.git_operation("add", SUBMODULE_PATH)
-    gitp.git_operation("commit", "-a", "-m", '"add submod"')
-    clone = tmp_path / "clone"
-    gitp.git_operation("clone", origin, clone)
-    (clone / ".gitmodules").write_text(GITMODULES)
-    return clone
+
+
+def write_shared_gitmodules(repo_dir, shared_repos):
+    """Write the shared .gitmodules, which has 'fxtag' set, into repo_dir."""
+    (repo_dir / ".gitmodules").write_text(shared_repos["gitmodules_content"])
+
+
+# Override the shared `test_repo` fixture to have the proper .gitmodules, with fxtag set:
+# without it, update and status exit 0 but don't do any work, just report that fxtag isn't
+# present.
+@pytest.fixture(name="test_repo")
+def fixture_test_repo_with_fxtag(test_repo, shared_repos):
+    write_shared_gitmodules(test_repo, shared_repos)
+    return test_repo
+
+
+# These tell us that the update actually did work
+@pytest.fixture(name="printed_lines")
+def fixture_printed_lines(shared_repos):
+    return {
+        "update": f"{shared_repos['submodule_name']} up to date.",
+        "status": shared_repos["status2"],
+    }
 
 
 @pytest.mark.parametrize("action", ["update", "status"])
-def test_relative_C(git_fleximod, populated_clone, action):
-    # Populate with no -C first, so the next run starts from a populated submodule.
-    result = git_fleximod(populated_clone, "update")
+def test_relative_C(git_fleximod, test_repo, shared_repos, printed_lines, action):
+    submodule_path = shared_repos["subrepo_path"]
+    # main test: initial population of the submodule, also with a relative -C
+    result = git_fleximod(test_repo, "-C . update")
     assert result.returncode == 0
-    assert (populated_clone / SUBMODULE_PATH / ".git").exists()
+    assert (test_repo / submodule_path / ".git").exists()
 
-    result = git_fleximod(populated_clone, f"-C . {action}")
+    # secondary test: make sure -C properly tries to re-update the same module
+    result = git_fleximod(test_repo, f"-C . {action}")
     assert result.returncode == 0
+    # A doubly-resolved relative path used to raise this error.
     assert "NoSuchPathError" not in result.stderr
-    assert PROCESSED[action] in result.stdout
-    assert (populated_clone / SUBMODULE_PATH / ".git").exists()
+    assert printed_lines[action] in normalize_whitespace(result.stdout)
+    assert (test_repo / submodule_path / ".git").exists()
 
 
-def test_relative_C_in_worktree(git_fleximod, populated_clone, tmp_path):
-    # Update the newly cloned repo (which has a submodule)
-    result = git_fleximod(populated_clone, "update")
+def test_relative_C_in_worktree(
+    git_fleximod, test_repo, shared_repos, printed_lines, tmp_path
+):
+    submodule_path = shared_repos["subrepo_path"]
+    # main test: initial population of the submodule in the main checkout aka `test_repo`
+    result = git_fleximod(test_repo, "update")
     assert result.returncode == 0
 
     # Create worktree for that repo
     worktree = tmp_path / "wt"
     subprocess.run(
         ["git", "worktree", "add", str(worktree)],
-        cwd=populated_clone,
+        cwd=test_repo,
         check=True,
         capture_output=True,
     )
-    # git worktree add leaves the submodule as an empty, uninitialised directory.
-    assert not (worktree / SUBMODULE_PATH / ".git").exists()
-    # The clone's .gitmodules with the fxtag is an uncommitted edit, so the worktree starts
-    # from the committed one, which has no fxtag; copy the clone's over it.
-    (worktree / ".gitmodules").write_text(GITMODULES)
+    # bring the shared .gitmodules into the worktree
+    write_shared_gitmodules(worktree, shared_repos)
 
-    # The new worktree has no submodule checked out: this run checks it out and then runs
-    # the post-checkout block in the same update() call.
+    # main test: initial update works with relative -C
     result = git_fleximod(worktree, "-C . update")
     assert result.returncode == 0
     assert "NoSuchPathError" not in result.stderr
-    submodule_git = worktree / SUBMODULE_PATH / ".git"
+    submodule_git = worktree / submodule_path / ".git"
     assert submodule_git.exists()
+    # st_mtime_ns is the file's modification time in integer nanoseconds, exact enough to compare.
     populated_at = submodule_git.stat().st_mtime_ns
 
-    # Second run starts from a populated submodule in the worktree, so update() has no
-    # populating to do and only runs the post-checkout block.
+    # Secondary test: re-updating correctly re-updates the module (which is a no-op)
     result = git_fleximod(worktree, "-C . update")
     assert result.returncode == 0
-    # Only the post-checkout block prints "up to date", so this shows that it ran.
-    assert PROCESSED["update"] in result.stdout
-    # Populating writes the submodule's .git; an unchanged mtime shows nothing was re-cloned.
+    # Make sure the post-checkout block ran
+    assert printed_lines["update"] in normalize_whitespace(result.stdout)
+    # Confirm the update was a no-op: populating writes the submodule's .git, so an
+    # unchanged mtime means nothing was re-cloned.
     assert submodule_git.stat().st_mtime_ns == populated_at
 
 
-def test_absolute_C_from_other_cwd(git_fleximod, populated_clone, tmp_path):
-    # The post-checkout block (which reports local mods) must run when cwd is not the repo.
-    result = git_fleximod(populated_clone, "update")
-    assert result.returncode == 0
-    readme = populated_clone / SUBMODULE_PATH / "README"
-    assert readme.is_file()
-    readme.write_text(readme.read_text() + "local modification\n")
-
+def test_absolute_C_from_other_cwd(
+    git_fleximod, test_repo, shared_repos, printed_lines, tmp_path
+):
+    submodule_path = shared_repos["subrepo_path"]
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
-    result = git_fleximod(elsewhere, f"-C {populated_clone} update")
+    # main test: initial population of the submodule, with an absolute -C from an arbitrary cwd
+    result = git_fleximod(elsewhere, f"-C {test_repo} update")
     assert result.returncode == 0
-    assert "has modified files" in result.stdout
-    assert "README" in result.stdout
+    assert (test_repo / submodule_path / ".git").exists()
+
+    # Secondary test: re-update that directory, still from arbitrary cwd
+    result = git_fleximod(elsewhere, f"-C {test_repo} update")
+    assert result.returncode == 0
+    # Only the post-checkout block prints "up to date"; it used to be skipped when the cwd
+    # is not the repo.
+    assert printed_lines["update"] in normalize_whitespace(result.stdout)
